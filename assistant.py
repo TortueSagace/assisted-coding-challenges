@@ -408,8 +408,7 @@ def start(context_path, questions=10):
     _current = Assistant(Path(context_path).read_text(encoding="utf-8"), questions)
     if _current.key:
         print(f"🤖 Assistant ready ({questions} questions, OpenRouter key from {_current.key_source}).")
-        print('Ask with ask("..."): your solution cell is attached automatically. '
-              "To get it corrected, put fix() as the last line of your solution cell.")
+        print("Write your questions in the cell below.")
     else:
         print(NO_KEY)
 
@@ -421,7 +420,11 @@ def _with_assistant(method, *args):
     return getattr(_current, method)(*args)
 
 
-def ask(question, *_ignored):
+def ask(question="", *_ignored):
+    if not str(question).strip():  # the notebook's placeholder: no question is used up
+        print('Write your question between the quotes, e.g. ask("Could a greedy approach work here?"), '
+              "then run the cell again.")
+        return
     _with_assistant("ask", question)
 
 
