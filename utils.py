@@ -21,6 +21,16 @@ def _user_traceback(e):
     return "".join(traceback.format_exception(type(e), e, tb))
 
 
+def _fail_bar(pbar, text):
+    """Show the progress bar as failed, with `text` as its label."""
+    pbar.set_description_str(text, refresh=False)
+    if hasattr(pbar, "container"):  # Jupyter widget: the red "danger" style survives close()
+        pbar.disp(bar_style="danger")
+    else:                           # console bar
+        pbar.colour = "red"
+        pbar.refresh()
+
+
 def get_trss(proc):
     """Get current time and RSS memory usage."""
     return perf_counter(), proc.memory_info().rss
@@ -512,24 +522,31 @@ def internal_evaluation(test_file_path, my_solution, check_solution, parse_tests
         return False
     
     proc = Process(os.getpid())
-    all_passed = True
-    
+
     # For complexity analysis
     time_by_n = defaultdict(list)
     memory_by_n = defaultdict(list)
-    
-    for test_num, test_input in tqdm(enumerate(tests, 1), total=len(tests)):
+
+    # Wrong answers and runtime errors are counted and the evaluation goes on; only an exceeded
+    # time or memory limit stops it (the complexity is broken, the remaining tests would be slow too).
+    failed = 0
+    first_failure = None   # (test number, message, traceback or None)
+    limit_message = None
+    pbar = tqdm(total=len(tests))
+    for test_num, test_input in enumerate(tests, 1):
         # Measure execution time
         t_start = perf_counter()
         mem_before = proc.memory_info().rss
-        
+
         try:
             user_result = my_solution(*test_input)
         except Exception as e:
-            print(f"\n❌  Runtime error at test {test_num}:\n")
-            print(_user_traceback(e), end="")
-            return False
-        
+            failed += 1
+            if first_failure is None:
+                first_failure = (test_num, f"Runtime error: {type(e).__name__}: {e}", _user_traceback(e))
+            pbar.update(1)
+            continue
+
         t_end = perf_counter()
         mem_after = proc.memory_info().rss
         exec_time = _confirm_time(my_solution, test_input, t_end - t_start, time_limit)
@@ -544,34 +561,47 @@ def internal_evaluation(test_file_path, my_solution, check_solution, parse_tests
         violation = _limit_violation(exec_time, mem_used, time_limit, memory_limit)
         if violation:
             size = f" (n = {get_input_size(test_input)})" if get_input_size is not None else ""
-            print(f"\n❌  {violation} at test {test_num}{size}")
-            all_passed = False
+            limit_message = f"{violation} at test {test_num}{size}"
             break
 
         check_result = check_solution(
             test_input, user_result, proc, time_limit, memory_limit
         )
-        
+
         # Unpack result (supports optional 4th element for custom error message)
         is_accurate, is_time_efficient, is_memory_efficient = check_result[:3]
         custom_message = check_result[3] if len(check_result) > 3 else None
-        
+
+        if not is_time_efficient:
+            limit_message = f"Maximum time exceeded at test {test_num}"
+            break
+        if not is_memory_efficient:
+            limit_message = f"Maximum memory exceeded at test {test_num}"
+            break
         if not is_accurate:
-            if custom_message:
-                print(f"\n❌  {custom_message}")
-            else:
-                print(f"\n❌  Wrong answer at test {test_num}")
-            all_passed = False
-            break
-        elif not is_time_efficient:
-            print(f"\n❌  Maximum time exceeded at test {test_num}")
-            all_passed = False
-            break
-        elif not is_memory_efficient:
-            print(f"\n❌  Maximum memory exceeded at test {test_num}")
-            all_passed = False
-            break
-    
+            failed += 1
+            if first_failure is None:
+                first_failure = (test_num, custom_message or "Wrong answer", None)
+        pbar.update(1)
+
+    all_passed = failed == 0 and limit_message is None
+    if limit_message:
+        _fail_bar(pbar, "❌ Limit exceeded")
+    elif failed:
+        _fail_bar(pbar, f"❌ {100 * failed / len(tests):.1f}% wrong")
+    pbar.close()
+
+    if limit_message:
+        print(f"\n❌  {limit_message}")
+    if failed:
+        done = pbar.n
+        print(f"\n❌  {failed}/{done} hidden tests failed ({100 * failed / done:.1f}%)")
+        test_num, message, trace = first_failure
+        print(f"    First failure (test {test_num}): {message}")
+        if trace:
+            print()
+            print(trace, end="")
+
     if all_passed:
         print(f"✅  All {len(tests)} tests passed!")
         
