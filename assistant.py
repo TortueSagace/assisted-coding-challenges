@@ -29,7 +29,6 @@ import os
 import re
 import sys
 import threading
-import time
 import traceback
 import urllib.error
 import urllib.request
@@ -217,32 +216,26 @@ def _code_block(answer):
 # --------------------------------------------- chat ---------------------------------------------
 
 class _Output:
-    """Live Markdown in a notebook (one display updated as the answer streams), plain text elsewhere."""
+    """The answer streams as plain text, then (in a notebook) the cell's output is replaced by the rendered
+    Markdown. Only print, clear_output and display: updating a display in place is ignored by VS Code."""
 
     def __init__(self):
-        self.text, self.last = "", 0.0
-        try:
-            from IPython.display import Markdown, display
-            if _ipython() is None:
-                raise ImportError
-            self.markdown = Markdown
-            self.handle = display(Markdown("*…*"), display_id=True)
-        except ImportError:
-            self.handle = None
+        self.text = ""
+        self.notebook = _ipython() is not None
+        print("⏳ ", end="", flush=True)
 
     def add(self, piece):
         self.text += piece
-        if self.handle is None:
-            print(piece, end="", flush=True)
-        elif time.time() - self.last > 0.2:
-            self.handle.update(self.markdown(self.text))
-            self.last = time.time()
+        print(piece, end="", flush=True)
 
     def finish(self, note):
-        if self.handle is None:
+        full = self.text + ("\n\n" if self.text else "") + note
+        if not self.notebook:
             print(("\n\n" if self.text else "") + note)
-        else:
-            self.handle.update(self.markdown(self.text + ("\n\n" if self.text else "") + note))
+            return
+        from IPython.display import Markdown, clear_output, display
+        clear_output(wait=True)
+        display(Markdown(full))
 
 
 class _ModelFailed(Exception):
