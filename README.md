@@ -1,6 +1,6 @@
 # Assisted Coding Challenges
 
-Tougher programming puzzles (Codeforces, 1800+ Elo) in Kaggle notebooks, with a small AI assistant by your side.
+Tougher programming puzzles from Codeforces, in Kaggle notebooks, with a small AI assistant by your side.
 It has read the statement and can explain, give hints and debug, but it won't solve the problem for you.
 The companion series without AI is [No-AI Coding Challenges](https://github.com/TortueSagace/no-ai-coding-challenges).
 
