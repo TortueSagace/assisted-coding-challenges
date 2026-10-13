@@ -250,14 +250,14 @@ class _ModelFailed(Exception):
 
 
 class Assistant:
-    def __init__(self, context, questions):
-        self.context, self.questions_left = context, questions
+    def __init__(self, context):
+        self.context = context
         self.key, self.key_source = find_key()
         self.backup = None  # the solution cell before the last fix()
         self.reset()
 
     def reset(self):
-        """Forget the conversation (the question budget is kept)."""
+        """Forget the conversation."""
         self.history = [{"role": "system", "content": SYSTEM_PROMPT.format(context=self.context)}]
         self.sent = None  # hash of the solution cell last shown to the model
 
@@ -288,9 +288,8 @@ class Assistant:
             return
         code = _code_block(answer)
         if code is None:
-            self.questions_left += 1
-            print("No complete my_solution in the answer: your cell was not changed, and this question was not "
-                  "counted. Try fix() again (another model may answer), or ask() about the bug.")
+            print("No complete my_solution in the answer: your cell was not changed. "
+                  "Try fix() again (another model may answer), or ask() about the bug.")
             return
         if not _is_solution_cell(code):
             code = cell.splitlines()[0] + "\n\n" + code
@@ -327,9 +326,6 @@ class Assistant:
             if not self.key:
                 print(NO_KEY)
                 return None
-        if self.questions_left <= 0:
-            print("No questions left for this challenge: the rest is up to you! 💪")
-            return None
         messages = self.history + [{"role": "user", "content": content}]
 
         out, errors = _Output(), []
@@ -351,19 +347,17 @@ class Assistant:
                 continue
             except (_ModelFailed, urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
                 if out.text:  # the answer broke off midway: don't restart it with another model
-                    out.finish(f"⚠️ The answer was interrupted ({e}). This question was not counted; ask again.")
+                    out.finish(f"⚠️ The answer was interrupted ({e}): ask again.")
                     return None
                 errors.append(f"{model}: {e}")
                 continue
             self.history = messages + [{"role": "assistant", "content": out.text}]
             if cell is not None:
                 self.sent = self._digest(cell)
-            self.questions_left -= 1
-            left = f"{self.questions_left} question{'s' if self.questions_left != 1 else ''} left"
-            out.finish(f"<sub>{model.removesuffix(':free')} · {left}</sub>")
+            out.finish(f"<sub>{model.removesuffix(':free')}</sub>")
             return out.text
         out.finish("⏳ Every model is busy or unavailable right now (free models are often rate-limited). "
-                   "Wait a minute and ask again; this question was not counted.\n\n"
+                   "Wait a minute and ask again.\n\n"
                    + "\n".join(f"- `{e}`" for e in errors))
         return None
 
@@ -402,12 +396,12 @@ def _error_message(error):
 
 # ------------------------------------------ notebook API ------------------------------------------
 
-def start(context_path, questions=10):
+def start(context_path, **_ignored):  # **_ignored: older notebooks passed a question budget
     """Set up the assistant for one challenge; context_path is the accN_context.md file of the repo."""
     global _current
-    _current = Assistant(Path(context_path).read_text(encoding="utf-8"), questions)
+    _current = Assistant(Path(context_path).read_text(encoding="utf-8"))
     if _current.key:
-        print(f"🤖 Assistant ready ({questions} questions, OpenRouter key from {_current.key_source}).")
+        print(f"🤖 Assistant ready (OpenRouter key from {_current.key_source}).")
         print("Write your questions in the cell below.")
     else:
         print(NO_KEY)
