@@ -49,8 +49,9 @@ MODELS = [
     "poolside/laguna-xs-2.1:free",
     "cohere/north-mini-code:free",  # slow and thinks aloud: last resort
 ]
-MAX_TOKENS = 2000
-MAX_TOKENS_FIX = 6000  # fix() rewrites the whole cell: more room than a chat answer
+# Per answer, for ask() and fix(): some models think aloud before answering, and fix() rewrites a whole cell.
+# The whole conversation is resent each time, up to the model's context window.
+MAX_TOKENS = 8000
 
 RESOLUTION_HEADER = "######################### RESOLUTION"  # first line of the notebook's solution cell
 COMMAND_LINE = re.compile(r"^\s*(?:assistant\.)?(?:fix|undo)\(.*\)\s*(?:#.*)?$")
@@ -247,6 +248,7 @@ class Assistant:
         self.context = context
         self.key, self.key_source = find_key()
         self.backup = None  # the solution cell before the last fix()
+        self.truncated = False  # did the last answer stop at MAX_TOKENS?
         self.reset()
 
     def reset(self):
@@ -276,7 +278,7 @@ class Assistant:
         cell = _strip_commands(current)
         parts = [FIX_REQUEST, f"Hint from me: {hint}" if hint else "",
                  f"My solution cell:\n```python\n{cell}```", sample_report() or ""]
-        answer = self._chat("\n\n".join(p for p in parts if p), cell, MAX_TOKENS_FIX)
+        answer = self._chat("\n\n".join(p for p in parts if p), cell)
         if answer is None:
             return
         code = _code_block(answer)
@@ -308,7 +310,7 @@ class Assistant:
     def _digest(text):
         return hashlib.sha256(text.encode()).hexdigest()
 
-    def _chat(self, content, cell=None, max_tokens=MAX_TOKENS):
+    def _chat(self, content, cell=None, max_tokens=None):
         """Send one user message; returns the answer, or None if nothing was answered (not counted)."""
         if not self.key:
             try:
@@ -347,7 +349,9 @@ class Assistant:
             self.history = messages + [{"role": "assistant", "content": out.text}]
             if cell is not None:
                 self.sent = self._digest(cell)
-            out.finish(f"<sub>{model.removesuffix(':free')}</sub>")
+            cut = ('✂️ *The answer reached the length limit: `ask("continue")` for the rest.*\n\n'
+                   if self.truncated else "")
+            out.finish(f"{cut}<sub>{model.removesuffix(':free')}</sub>")
             return out.text
         out.finish("⏳ Every model is busy or unavailable right now (free models are often rate-limited). "
                    "Wait a minute and ask again.\n\n"
@@ -355,6 +359,7 @@ class Assistant:
         return None
 
     def _stream(self, model, messages, max_tokens=None):
+        self.truncated = False
         body = {"model": model, "messages": messages, "stream": True, "max_tokens": max_tokens or MAX_TOKENS,
                 "reasoning": {"enabled": False}}
         request = urllib.request.Request(API_URL, data=json.dumps(body).encode(), headers={
@@ -373,6 +378,8 @@ class Assistant:
                 if "error" in chunk:
                     raise _ModelFailed(chunk["error"].get("message", "provider error"))
                 choices = chunk.get("choices") or [{}]
+                if choices[0].get("finish_reason") == "length":
+                    self.truncated = True
                 piece = (choices[0].get("delta") or {}).get("content")
                 if piece:
                     yield piece
