@@ -49,16 +49,15 @@ MODELS = [
     "poolside/laguna-xs-2.1:free",
     "cohere/north-mini-code:free",  # slow and thinks aloud: last resort
 ]
-# Per answer, for ask() and fix(): some models think aloud before answering, and fix() rewrites a whole cell.
-# The whole conversation is resent each time, up to the model's context window.
+# The assistant's context window, whatever the model: the whole conversation (system prompt with the statement,
+# questions, answers) plus the next answer must fit in it. Each answer gets the room that is left (at most
+# MAX_TOKENS). After an answer, a conversation over PRUNE_AT of the window loses its oldest question/answer pairs,
+# PRUNE_SHARE of the window's worth; the same happens before sending when less than MIN_ANSWER_ROOM is left.
+CONTEXT_WINDOW = 8000
 MAX_TOKENS = 8000
-
-# Context window: after an answer, a conversation over PRUNE_AT of the model's window loses its oldest messages,
-# PRUNE_SHARE of the window's worth; the same happens when a request is rejected because the window is full.
+MIN_ANSWER_ROOM = 1000
 PRUNE_AT, PRUNE_SHARE = 0.9, 0.1
-DEFAULT_CONTEXT = 128_000  # when OpenRouter's model list can't be read
 CONTEXT_FULL = re.compile(r"context (length|window)|maximum context|too many tokens|prompt is too long", re.I)
-_windows = None  # model id -> context length (tokens), read once from OpenRouter
 
 RESOLUTION_HEADER = "######################### RESOLUTION"  # first line of the notebook's solution cell
 COMMAND_LINE = re.compile(r"^\s*(?:assistant\.)?(?:fix|undo)\(.*\)\s*(?:#.*)?$")
@@ -113,25 +112,8 @@ def find_key():
     return None, None
 
 
-def context_window(model):
-    """The model's context window in tokens, from OpenRouter's model list (read once)."""
-    global _windows
-    if _windows is None:
-        try:
-            with urllib.request.urlopen("https://openrouter.ai/api/v1/models", timeout=15) as response:
-                _windows = {m["id"]: m.get("context_length") for m in json.load(response)["data"]}
-        except Exception:  # offline or changed format: use the default
-            _windows = {}
-    return _windows.get(model) or DEFAULT_CONTEXT
-
-
 def _chars(messages):
     return sum(len(m["content"]) for m in messages)
-
-
-def _estimate(messages):
-    """Rough token count when the API doesn't report usage: about 4 characters per token."""
-    return _chars(messages) // 4
 
 
 # ------------------------------- what the model may see of the notebook -------------------------------
@@ -353,8 +335,17 @@ class Assistant:
                 return None
         user = {"role": "user", "content": content}
         out, errors, notes = _Output(), [], []
+        if self._tokens(self.history + [user]) > CONTEXT_WINDOW - MIN_ANSWER_ROOM:  # no room left for an answer
+            notes.append(f"⚠️ The conversation reached the context window ({CONTEXT_WINDOW:,} tokens).")
+            while self._tokens(self.history + [user]) > CONTEXT_WINDOW - MIN_ANSWER_ROOM:
+                pruned = self._prune()
+                if pruned is None:
+                    out.finish("\n\n".join(notes + ["This message alone is too long for the context window: "
+                                                    "shorten your question or your solution cell."]))
+                    return None
+                notes.append(pruned)
         for model in MODELS:
-            while True:  # one retry per pruning when the conversation no longer fits this model's window
+            while True:  # retried after pruning if the provider says the conversation doesn't fit
                 try:
                     for piece in self._stream(model, self.history + [user], max_tokens):
                         out.add(piece)
@@ -368,7 +359,7 @@ class Assistant:
                     if e.code == 429 and "per-day" in message:
                         out.finish(f"⏳ Daily limit of free requests reached on your OpenRouter account ({message}).")
                         return None
-                    if e.code in (400, 413) and CONTEXT_FULL.search(message) and self._window_full(model, notes):
+                    if e.code in (400, 413) and CONTEXT_FULL.search(message) and self._window_full(notes):
                         continue  # same model, shorter conversation
                     errors.append(f"{model}: {e.code} {message}")
                     break
@@ -376,7 +367,7 @@ class Assistant:
                     if out.text:  # the answer broke off midway: don't restart it with another model
                         out.finish(f"⚠️ The answer was interrupted ({e}): ask again.")
                         return None
-                    if CONTEXT_FULL.search(str(e)) and self._window_full(model, notes):
+                    if CONTEXT_FULL.search(str(e)) and self._window_full(notes):
                         continue
                     errors.append(f"{model}: {e}")
                     break
@@ -391,50 +382,57 @@ class Assistant:
         self.history += [user, {"role": "assistant", "content": out.text}]
         if cell is not None:
             self.sent = self._digest(cell)
-        window = context_window(model)
-        self.used = (self.usage or {}).get("total_tokens") or _estimate(self.history)
+        self.used = (self.usage or {}).get("total_tokens") or self._tokens(self.history)
         if self.truncated:
             notes.append('✂️ *The answer reached the length limit: `ask("continue")` for the rest.*')
-        if self.used >= PRUNE_AT * window:
-            notes.append(f"⚠️ The conversation uses {self.used:,} of the {window:,} tokens of "
-                         f"{model.removesuffix(':free')}'s context window (over {PRUNE_AT:.0%}).")
-            pruned = self._prune(window)
+        if self.used >= PRUNE_AT * CONTEXT_WINDOW:
+            notes.append(f"⚠️ The conversation uses {self.used:,} of the {CONTEXT_WINDOW:,} tokens of the context "
+                         f"window (over {PRUNE_AT:.0%}).")
+            pruned = self._prune()
             if pruned:
                 notes.append(pruned)
-        notes.append(f"<sub>{model.removesuffix(':free')} · context {self.used:,} / {window:,} tokens</sub>")
+        notes.append(f"<sub>{model.removesuffix(':free')} · context {self.used:,} / {CONTEXT_WINDOW:,} tokens</sub>")
         out.finish("\n\n".join(notes))
         return out.text
 
-    def _window_full(self, model, notes):
-        """The request was rejected because the conversation no longer fits: tell the user and prune.
+    def _window_full(self, notes):
+        """The provider rejected the request because the conversation doesn't fit: tell the user and prune.
         True if something was removed (the request can be retried)."""
-        window = context_window(model)
-        notes.append(f"⚠️ The conversation reached the context window of {model.removesuffix(':free')} "
-                     f"({window:,} tokens).")
-        pruned = self._prune(window)
+        notes.append("⚠️ The conversation reached the model's context window.")
+        pruned = self._prune()
         if pruned:
             notes.append(pruned)
         return pruned is not None
 
-    def _prune(self, window):
+    def _tokens(self, messages):
+        """Token estimate, scaled on the last count reported by OpenRouter (about 4 characters per token before)."""
+        per_char = self.used / _chars(self.history) if self.used else 0.25
+        return round(per_char * _chars(messages))
+
+    def _room(self, messages):
+        """Tokens left in the context window for the answer to these messages."""
+        return max(1, min(MAX_TOKENS, CONTEXT_WINDOW - self._tokens(messages)))
+
+    def _prune(self):
         """Drop the oldest question/answer pairs (never the system prompt) to free PRUNE_SHARE of the window.
         Returns a note for the user, or None if there was nothing to drop."""
-        per_char = (self.used / _chars(self.history)) if self.used else 0.25  # tokens per character
-        target, freed, dropped = PRUNE_SHARE * window, 0.0, 0
+        target, freed, dropped = PRUNE_SHARE * CONTEXT_WINDOW, 0, 0
         while freed < target and len(self.history) > 2:
-            pair, self.history = self.history[1:3], self.history[:1] + self.history[3:]
-            freed += per_char * _chars(pair)
-            dropped += len(pair)
+            pair = self.history[1:3]
+            tokens = self._tokens(pair)
+            self.history = self.history[:1] + self.history[3:]
+            self.used = max(0, self.used - tokens)  # keeps the tokens-per-character ratio of _tokens right
+            freed, dropped = freed + tokens, dropped + len(pair)
         if not dropped:
             return None
-        self.used = max(0, round(self.used - freed)) if self.used else _estimate(self.history)
         self.sent = None  # the solution cell may have been dropped: send it again with the next question
-        return (f"✂️ Context window pruned: the oldest {dropped} messages (about {round(freed):,} tokens) were "
-                f"removed from the conversation.")
+        return (f"✂️ Context window pruned: the oldest {dropped} messages (about {freed:,} tokens) were removed "
+                f"from the conversation.")
 
     def _stream(self, model, messages, max_tokens=None):
         self.truncated, self.usage = False, None
-        body = {"model": model, "messages": messages, "stream": True, "max_tokens": max_tokens or MAX_TOKENS,
+        body = {"model": model, "messages": messages, "stream": True,
+                "max_tokens": max_tokens or self._room(messages),
                 "reasoning": {"enabled": False}, "usage": {"include": True}}
         request = urllib.request.Request(API_URL, data=json.dumps(body).encode(), headers={
             "Authorization": f"Bearer {self.key}", "Content-Type": "application/json",
