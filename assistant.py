@@ -53,6 +53,13 @@ MODELS = [
 # The whole conversation is resent each time, up to the model's context window.
 MAX_TOKENS = 8000
 
+# Context window: after an answer, a conversation over PRUNE_AT of the model's window loses its oldest messages,
+# PRUNE_SHARE of the window's worth; the same happens when a request is rejected because the window is full.
+PRUNE_AT, PRUNE_SHARE = 0.9, 0.1
+DEFAULT_CONTEXT = 128_000  # when OpenRouter's model list can't be read
+CONTEXT_FULL = re.compile(r"context (length|window)|maximum context|too many tokens|prompt is too long", re.I)
+_windows = None  # model id -> context length (tokens), read once from OpenRouter
+
 RESOLUTION_HEADER = "######################### RESOLUTION"  # first line of the notebook's solution cell
 COMMAND_LINE = re.compile(r"^\s*(?:assistant\.)?(?:fix|undo)\(.*\)\s*(?:#.*)?$")
 
@@ -104,6 +111,27 @@ def find_key():
                 if sep and name.strip().removeprefix("export ").strip() == KEY_NAME and value.strip():
                     return value.strip().strip("'\""), ".env file"
     return None, None
+
+
+def context_window(model):
+    """The model's context window in tokens, from OpenRouter's model list (read once)."""
+    global _windows
+    if _windows is None:
+        try:
+            with urllib.request.urlopen("https://openrouter.ai/api/v1/models", timeout=15) as response:
+                _windows = {m["id"]: m.get("context_length") for m in json.load(response)["data"]}
+        except Exception:  # offline or changed format: use the default
+            _windows = {}
+    return _windows.get(model) or DEFAULT_CONTEXT
+
+
+def _chars(messages):
+    return sum(len(m["content"]) for m in messages)
+
+
+def _estimate(messages):
+    """Rough token count when the API doesn't report usage: about 4 characters per token."""
+    return _chars(messages) // 4
 
 
 # ------------------------------- what the model may see of the notebook -------------------------------
@@ -249,12 +277,14 @@ class Assistant:
         self.key, self.key_source = find_key()
         self.backup = None  # the solution cell before the last fix()
         self.truncated = False  # did the last answer stop at MAX_TOKENS?
+        self.usage = None  # token usage reported for the last answer
         self.reset()
 
     def reset(self):
         """Forget the conversation."""
         self.history = [{"role": "system", "content": SYSTEM_PROMPT.format(context=self.context)}]
         self.sent = None  # hash of the solution cell last shown to the model
+        self.used = 0  # tokens of the conversation after the last answer
 
     def ask(self, question, *_ignored):
         """Ask a question. The solution cell and its sample results are attached when they changed."""
@@ -321,47 +351,91 @@ class Assistant:
             if not self.key:
                 print(NO_KEY)
                 return None
-        messages = self.history + [{"role": "user", "content": content}]
-
-        out, errors = _Output(), []
+        user = {"role": "user", "content": content}
+        out, errors, notes = _Output(), [], []
         for model in MODELS:
-            try:
-                for piece in self._stream(model, messages, max_tokens):
-                    out.add(piece)
-                if not out.text.strip():
-                    raise _ModelFailed("empty answer")
-            except urllib.error.HTTPError as e:
-                message = _error_message(e)
-                if e.code == 401:
-                    out.finish(f"🔑 OpenRouter rejected the key ({message}). Check {KEY_NAME}.")
-                    return None
-                if e.code == 429 and "per-day" in message:
-                    out.finish(f"⏳ Daily limit of free requests reached on your OpenRouter account ({message}).")
-                    return None
-                errors.append(f"{model}: {e.code} {message}")
-                continue
-            except (_ModelFailed, urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
-                if out.text:  # the answer broke off midway: don't restart it with another model
-                    out.finish(f"⚠️ The answer was interrupted ({e}): ask again.")
-                    return None
-                errors.append(f"{model}: {e}")
-                continue
-            self.history = messages + [{"role": "assistant", "content": out.text}]
-            if cell is not None:
-                self.sent = self._digest(cell)
-            cut = ('✂️ *The answer reached the length limit: `ask("continue")` for the rest.*\n\n'
-                   if self.truncated else "")
-            out.finish(f"{cut}<sub>{model.removesuffix(':free')}</sub>")
-            return out.text
-        out.finish("⏳ Every model is busy or unavailable right now (free models are often rate-limited). "
-                   "Wait a minute and ask again.\n\n"
-                   + "\n".join(f"- `{e}`" for e in errors))
+            while True:  # one retry per pruning when the conversation no longer fits this model's window
+                try:
+                    for piece in self._stream(model, self.history + [user], max_tokens):
+                        out.add(piece)
+                    if not out.text.strip():
+                        raise _ModelFailed("empty answer")
+                except urllib.error.HTTPError as e:
+                    message = _error_message(e)
+                    if e.code == 401:
+                        out.finish(f"🔑 OpenRouter rejected the key ({message}). Check {KEY_NAME}.")
+                        return None
+                    if e.code == 429 and "per-day" in message:
+                        out.finish(f"⏳ Daily limit of free requests reached on your OpenRouter account ({message}).")
+                        return None
+                    if e.code in (400, 413) and CONTEXT_FULL.search(message) and self._window_full(model, notes):
+                        continue  # same model, shorter conversation
+                    errors.append(f"{model}: {e.code} {message}")
+                    break
+                except (_ModelFailed, urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+                    if out.text:  # the answer broke off midway: don't restart it with another model
+                        out.finish(f"⚠️ The answer was interrupted ({e}): ask again.")
+                        return None
+                    if CONTEXT_FULL.search(str(e)) and self._window_full(model, notes):
+                        continue
+                    errors.append(f"{model}: {e}")
+                    break
+                return self._answered(model, user, out, notes, cell)
+        out.finish("\n\n".join(notes + ["⏳ Every model is busy or unavailable right now (free models are often "
+                                        "rate-limited). Wait a minute and ask again."])
+                   + "\n\n" + "\n".join(f"- `{e}`" for e in errors))
         return None
 
+    def _answered(self, model, user, out, notes, cell):
+        """Record a finished answer, prune the conversation if it is over 90% of the window, show the answer."""
+        self.history += [user, {"role": "assistant", "content": out.text}]
+        if cell is not None:
+            self.sent = self._digest(cell)
+        window = context_window(model)
+        self.used = (self.usage or {}).get("total_tokens") or _estimate(self.history)
+        if self.truncated:
+            notes.append('✂️ *The answer reached the length limit: `ask("continue")` for the rest.*')
+        if self.used >= PRUNE_AT * window:
+            notes.append(f"⚠️ The conversation uses {self.used:,} of the {window:,} tokens of "
+                         f"{model.removesuffix(':free')}'s context window (over {PRUNE_AT:.0%}).")
+            pruned = self._prune(window)
+            if pruned:
+                notes.append(pruned)
+        notes.append(f"<sub>{model.removesuffix(':free')} · context {self.used:,} / {window:,} tokens</sub>")
+        out.finish("\n\n".join(notes))
+        return out.text
+
+    def _window_full(self, model, notes):
+        """The request was rejected because the conversation no longer fits: tell the user and prune.
+        True if something was removed (the request can be retried)."""
+        window = context_window(model)
+        notes.append(f"⚠️ The conversation reached the context window of {model.removesuffix(':free')} "
+                     f"({window:,} tokens).")
+        pruned = self._prune(window)
+        if pruned:
+            notes.append(pruned)
+        return pruned is not None
+
+    def _prune(self, window):
+        """Drop the oldest question/answer pairs (never the system prompt) to free PRUNE_SHARE of the window.
+        Returns a note for the user, or None if there was nothing to drop."""
+        per_char = (self.used / _chars(self.history)) if self.used else 0.25  # tokens per character
+        target, freed, dropped = PRUNE_SHARE * window, 0.0, 0
+        while freed < target and len(self.history) > 2:
+            pair, self.history = self.history[1:3], self.history[:1] + self.history[3:]
+            freed += per_char * _chars(pair)
+            dropped += len(pair)
+        if not dropped:
+            return None
+        self.used = max(0, round(self.used - freed)) if self.used else _estimate(self.history)
+        self.sent = None  # the solution cell may have been dropped: send it again with the next question
+        return (f"✂️ Context window pruned: the oldest {dropped} messages (about {round(freed):,} tokens) were "
+                f"removed from the conversation.")
+
     def _stream(self, model, messages, max_tokens=None):
-        self.truncated = False
+        self.truncated, self.usage = False, None
         body = {"model": model, "messages": messages, "stream": True, "max_tokens": max_tokens or MAX_TOKENS,
-                "reasoning": {"enabled": False}}
+                "reasoning": {"enabled": False}, "usage": {"include": True}}
         request = urllib.request.Request(API_URL, data=json.dumps(body).encode(), headers={
             "Authorization": f"Bearer {self.key}", "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/TortueSagace/assisted-coding-challenges",
@@ -377,6 +451,8 @@ class Assistant:
                 chunk = json.loads(data)
                 if "error" in chunk:
                     raise _ModelFailed(chunk["error"].get("message", "provider error"))
+                if chunk.get("usage"):  # the last chunk: tokens of the whole request and answer
+                    self.usage = chunk["usage"]
                 choices = chunk.get("choices") or [{}]
                 if choices[0].get("finish_reason") == "length":
                     self.truncated = True
